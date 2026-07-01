@@ -2,8 +2,7 @@ package eu.kanade.tachiyomi.extension.all.nhentai
 
 import android.content.SharedPreferences
 import android.util.Log
-import android.widget.Toast
-import androidx.preference.EditTextPreference
+import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -52,18 +51,75 @@ class NHentai(
 
     private var nextHash: String? = null
     private val apiPath = "api/v2"
+    private val popularSort: String
+        get() = preferences.getString(PREF_POPULAR_SORT, "popular-week") ?: "popular-week"
 
     private val json: Json by injectLazy()
     private var storedToken: String? = null
 
     private val ddosGuardIntercept = DDosGuardInterceptor(network.client)
 
+    private fun imageServerInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val url = request.url.toString()
+
+        val isImageServer = imageServers.any { url.startsWith(it) }
+        val isThumbServer = thumbServers.any { url.startsWith(it) }
+
+        if (!isImageServer && !isThumbServer) {
+            return chain.proceed(request)
+        }
+
+        val servers = if (isImageServer) imageServers else thumbServers
+        val currentServer = servers.firstOrNull { url.startsWith(it) }
+            ?: return chain.proceed(request)
+        val remainingServers = servers.filter { it != currentServer }
+
+        // coba server pertama
+        val firstResponse = try {
+            chain.proceed(request)
+        } catch (e: Exception) {
+            Log.d("Nhentai", "server $currentServer gagal: ${e.message}, coba server lain")
+            null
+        }
+
+        if (firstResponse != null && firstResponse.isSuccessful) return firstResponse
+        firstResponse?.close()
+
+        Log.d("Nhentai", "gagal load dari $currentServer, coba server lain")
+
+        // coba server lain
+        for (server in remainingServers) {
+            val newUrl = url.replace(currentServer, server)
+            Log.d("Nhentai", "coba ke server: $newUrl")
+
+            val response = try {
+                val newRequest = request.newBuilder().url(newUrl).build()
+                chain.proceed(newRequest)
+            } catch (e: Exception) {
+                Log.d("Nhentai", "server $server juga gagal: ${e.message}")
+                null
+            }
+
+            if (response != null && response.isSuccessful) {
+                Log.d("Nhentai", "berhasil pakai server: $server")
+                return response
+            }
+            response?.close()
+        }
+
+        // semua gagal, throw exception
+        throw Exception("Semua image server gagal untuk: $url")
+    }
+
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ENGLISH).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
+
     override val client: OkHttpClient = network.client.newBuilder()
         .addInterceptor(ddosGuardIntercept)
         .addInterceptor(::tokenInterceptor)
+        .addInterceptor(::imageServerInterceptor)
         .rateLimit(2)
         .build()
 
@@ -121,18 +177,15 @@ class NHentai(
         return storedToken!!
     }
 
-    companion object {
-        const val PREFIX_ID = "id:"
-        private const val PREF_TITLE = "pref_title"
-        private const val PREF_API_KEY = "api_key"
-    }
-
     private val preferences: SharedPreferences by getPreferencesLazy()
 
     private val displayFullTitle: Boolean get() = preferences.getBoolean(PREF_TITLE, false)
 
     private val shortenTitleRegex = Regex("""(\[[^]]*]|[({][^)}]*[)}])""")
     private fun String.shortenTitle() = this.replace(shortenTitleRegex, "").trim()
+
+    private val apiKey: String
+        get() = preferences.getString(PREF_API_KEY, "") ?: ""
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         SwitchPreferenceCompat(screen.context).apply {
@@ -141,33 +194,55 @@ class NHentai(
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        val baseUrlPref =
-            EditTextPreference(screen.context).apply {
-                key = PREF_API_KEY
-                title = "insert api key"
-                summary = "masukan api key"
-                "woilah cik"
-                dialogTitle = "ganti lah"
-                dialogMessage = "buka di web nya king, cari api keynya"
+        ListPreference(screen.context).apply {
+            key = PREF_POPULAR_SORT
+            title = "Popular manga sort"
+            entries = arrayOf(
+                "Popular: All Time",
+                "Popular: Month",
+                "Popular: Week",
+                "Popular: Today",
+            )
+            entryValues = arrayOf(
+                "popular",
+                "popular-month",
+                "popular-week",
+                "popular-today",
+            )
+            setDefaultValue("popular-week")
+            summary = "%s"
 
-                setOnPreferenceChangeListener { _, _ ->
-                    Toast.makeText(screen.context, "restart kang", Toast.LENGTH_LONG).show()
-                    true
-                }
+            setOnPreferenceChangeListener { _, newValue ->
+                preferences.edit()
+                    .putString(PREF_POPULAR_SORT, newValue as String)
+                    .commit()
             }
-        screen.addPreference(baseUrlPref)
-    }
+        }.also(screen::addPreference)
 
-    private val apiKey: String
-        get() = preferences.getString(PREF_API_KEY, "") ?: ""
+//        val baseUrlPref =
+//            EditTextPreference(screen.context).apply {
+//                key = PREF_API_KEY
+//                title = "insert api key"
+//                summary = "masukan api key"
+//                "woilah cik"
+//                dialogTitle = "ganti lah"
+//                dialogMessage = "buka di web nya king, cari api keynya"
+//
+//                setOnPreferenceChangeListener { _, _ ->
+//                    Toast.makeText(screen.context, "restart kang", Toast.LENGTH_LONG).show()
+//                    true
+//                }
+//            }
+//        screen.addPreference(baseUrlPref)
+    }
 
     override fun popularMangaRequest(page: Int): Request {
         Log.d("Nhentai", "lewat ke popularMangaRequest")
 
         val url = if (nhentaiLang.isBlank()) {
-            "$baseUrl/search/?q=\"\"&sort=popular-week&page=$page"
+            "$baseUrl/search/?q=\"\"&sort=$popularSort&page=$page"
         } else {
-            "$baseUrl/language/$nhentaiLang/?sort=popular-week&page=$page"
+            "$baseUrl/language/$nhentaiLang/?sort=$popularSort&page=$page"
         }
 
         return GET(url, headers)
@@ -177,7 +252,7 @@ class NHentai(
         Log.d("Nhentai", "lewat ke popularMangaParse")
 
         val document = response.asJsoup()
-        Log.d("Nhentai", "lewat ke popularMangaParse: $document")
+//        Log.d("Nhentai", "lewat ke popularMangaParse: $document")
 
         if (document.text().contains("Max keywords of 3 exceeded.")) {
             throw Exception("Login required for more than 3 filters")
@@ -209,54 +284,95 @@ class NHentai(
         return MangasPage(mangas, hasNextPage)
     }
 
+    override fun latestUpdatesRequest(page: Int): Request {
+        val url = if (nhentaiLang.isBlank()) {
+            "$baseUrl/search/?q=\"\"&sort=date&page=$page"
+        } else {
+            "$baseUrl/language/$nhentaiLang/?sort=date&page=$page"
+        }
+
+        return GET(url, headers)
+    }
+
+    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
+
     override fun fetchSearchManga(
         page: Int,
         query: String,
         filters: FilterList,
-    ): Observable<MangasPage> = if (query.startsWith("https://")) {
-        Log.d("Nhentai", "lewat ke fetchSearchManga")
-
-        val url = query.toHttpUrl()
-        if (url.host != baseUrl.toHttpUrl().host) {
-            throw Exception("Unsupported url")
+    ): Observable<MangasPage> = when {
+        // handle full URL paste
+        query.startsWith("https://") -> {
+            Log.d("Nhentai", "lewat ke searchMangaRequest, dari link")
+            val url = query.toHttpUrl()
+            if (url.host != baseUrl.toHttpUrl().host) {
+                throw Exception("Unsupported url")
+            }
+            val id = url.pathSegments[1]
+            fetchSearchManga(page, "$PREFIX_ID$id", filters)
         }
-        val id = url.pathSegments[1]
-        fetchSearchManga(page, "$PREFIX_ID$id", filters)
-    } else if (query.startsWith(PREFIX_ID)) {
-        val url = "/g/${query.substringAfter(PREFIX_ID)}"
-        val manga = SManga.create().apply { this.url = url }
-        fetchMangaDetails(manga).map {
-            MangasPage(listOf(it.apply { this.url = url }), false)
+        // handle PREFIX_ID search (misal "id:659710")
+        query.startsWith(PREFIX_ID) -> {
+            Log.d("Nhentai", "lewat ke searchMangaRequest, dari prefix id:")
+            val id = query.substringAfter(PREFIX_ID)
+            val manga = SManga.create().apply { url = "/g/$id/" }
+            fetchMangaDetails(manga).map {
+                MangasPage(listOf(it.apply { url = "/g/$id/" }), false)
+            }
         }
-    } else {
-        super.fetchSearchManga(page, query, filters)
+        // handle pure integer (langsung ketik ID-nya)
+        query.toIntOrNull() != null -> {
+            Log.d("Nhentai", "lewat ke searchMangaRequest, full integer")
+            val manga = SManga.create().apply { url = "/g/$query/" }
+            fetchMangaDetails(manga).map {
+                MangasPage(listOf(it.apply { url = "/g/$query/" }), false)
+            }
+        }
+        // normal search
+        else -> {
+            Log.d("Nhentai", "lewat ke searchMangaRequest, ke else , $query")
+            super.fetchSearchManga(page, query, filters)
+        }
     }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val request = popularMangaRequest(page)
         Log.d("Nhentai", "lewat ke searchMangaRequest")
 
         val finalQuery: MutableList<String> = mutableListOf(query)
 
         if (lang != "all") {
-            finalQuery.add("language:$nhentaiLang$")
+            finalQuery.add("language:$nhentaiLang")
         }
+
+        val offsetPage = filters.filterIsInstance<OffsetPageFilter>()
+            .firstOrNull()?.state?.toIntOrNull()?.plus(page) ?: page
+
+        val isFavorite = filters.filterIsInstance<FavoriteFilter>()
+            .firstOrNull()?.state == true
+
+        // ambil sort value duluan sebelum loop
+        val sortValue = filters.filterIsInstance<SortFilter>()
+            .firstOrNull()?.getValue() ?: "popular"
+
         filters.forEach { filter ->
             when (filter) {
                 is TextFilter -> {
                     if (filter.state.isNotEmpty()) {
+                        val noQuotes = filter.tag == "pages" || filter.tag == "uploaded"
                         finalQuery.addAll(
                             filter.state.split(",").filter { it.isNotBlank() }.map {
-                                (if (it.trim().startsWith("-")) "-" else "") + "${filter.tag}:\"${it.trim().replace("-", "")}\""
+                                val trimmed = it.trim()
+                                val prefix = if (trimmed.startsWith("-")) "-" else ""
+                                val value = trimmed.removePrefix("-")
+                                if (noQuotes) {
+                                    "$prefix${filter.tag}:$value"
+                                } else {
+                                    "$prefix${filter.tag}:\"$value\""
+                                }
                             },
                         )
                     }
                 }
-
-                is OptionFilter -> {
-                    if (filter.state > 0) finalQuery.add("opt:${filter.getValue()}")
-                }
-
                 is CategoryFilter -> {
                     filter.state.forEach {
                         when {
@@ -265,18 +381,24 @@ class NHentai(
                         }
                     }
                 }
-
                 else -> {}
             }
         }
 
-        val url = request.url.newBuilder()
-            .setQueryParameter("q", finalQuery.joinToString(" "))
+        val baseSearchUrl = if (isFavorite) "$baseUrl/favorites/" else "$baseUrl/search/"
+
+        val url = baseSearchUrl.toHttpUrl().newBuilder()
+            .addQueryParameter("q", finalQuery.joinToString(" ").trim().ifBlank { "\"\"" })
+            .addQueryParameter("page", offsetPage.toString())
+            .apply {
+                // sort jadi parameter terpisah, bukan bagian dari q
+                if (!isFavorite) addQueryParameter("sort", sortValue)
+            }
             .build()
 
-        return request.newBuilder()
-            .url(url)
-            .build()
+        Log.d("Nhentai", "hasil url: $url")
+
+        return GET(url, headers)
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
@@ -298,7 +420,7 @@ class NHentai(
 
         // pake method ke web langsung
         val document = response.asJsoup()
-        Log.d("Nhentai", "$document")
+//        Log.d("Nhentai", "$document")
         return SManga.create().apply {
             title = document.select("a[href^=/g/] img").attr("alt")
             thumbnail_url = document.select("a[href^=/g/] img").attr("src")
@@ -400,22 +522,31 @@ class NHentai(
 
     private fun thumbUrlToFullUrl(thumbUrl: String): String {
         return thumbUrl
-            .replace(Regex("""//t(\d)\."""), "//i1.") // t2. -> i2.
-            .replace(Regex("""(\d+)t\.webp(\.webp)?$"""), "$1.webp") // 1t.webp.webp atau 1t.webp -> 1.webp
+            .replace(Regex("""//t(\d)\."""), "//i$1.") // t2. -> i2. (fix: preserve angka servernya)
+            .replace(Regex("""(\d+)t\.(\w+)(\.\w+)?$"""), "$1.$2") // hapus suffix 't' dan double extension
     }
 
     override fun imageUrlParse(response: Response): String = response.asJsoup().select(".entry-content img").attr("abs:src")
 
     override fun getFilterList(): FilterList = getFilters()
 
-    override fun latestUpdatesRequest(page: Int): Request {
-        val url = if (nhentaiLang.isBlank()) {
-            "$baseUrl/search/?q=\"\"&sort=date&page=$page"
-        } else {
-            "$baseUrl/language/$nhentaiLang/?sort=date&page=$page"
-        }
+    companion object {
+        const val PREFIX_ID = "id:"
+        private const val PREF_TITLE = "pref_title"
+        private const val PREF_API_KEY = "api_key"
+        private val imageServers = listOf(
+            "https://i1.nhentai.net",
+            "https://i2.nhentai.net",
+            "https://i3.nhentai.net",
+            "https://i4.nhentai.net",
+        )
 
-        return GET(url, headers)
+        private val thumbServers = listOf(
+            "https://t1.nhentai.net",
+            "https://t2.nhentai.net",
+            "https://t3.nhentai.net",
+            "https://t4.nhentai.net",
+        )
+        private const val PREF_POPULAR_SORT = "pref_popular_sort"
     }
-    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
 }
